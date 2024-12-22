@@ -58,7 +58,7 @@ BYTE shellcode_data_x64[] = {
     0x48, 0x81, 0xC1, 0x10, 0x01, 0x00, 0x00,   //add         rcx, 110h
     0xFF, 0x93, 0x00, 0x01, 0x00, 0x00,         //call        qword ptr[rbx + 100h]
     0x48, 0x85, 0xC0,                           //test        rax, rax
-    0x74, 0x06,                                 //je          error
+    0x75, 0x06,                                 //jne         error
     0x48, 0x83, 0xC4, 0x20,                     //add         rsp, 20h
     0x5B,                                       //pop         rbx
     0xC3,                                       //ret
@@ -76,7 +76,7 @@ typedef struct _INJECTION_CONTEXT {
     WCHAR DllName[0x100];               //0x110
 } INJECTION_CONTEXT, * PINJECTION_CONTEXT;
 
-#if 0 
+#if 0
 DWORD InjectorThread(LPVOID pContext)
 {
     HMODULE h = LoadLibrary((LPCWSTR)pContext);
@@ -95,62 +95,90 @@ DWORD InjectorThread(LPVOID pContext)
 
 int main()
 {
-    std::cout << "Hello World!\n";
     int res = -1;
+    HANDLE h = NULL;
 
-//#if 1
-    HMODULE h = LoadLibrary(L"DllToInject.dll");    //path is relative cause dll is places in same dir as exe!
-    //TODO: need absolute path
-    if (nullptr == h) {
-        printf("Dll load failed code=%x ! \n", GetLastError());
+    // Get full path to the DLL
+    WCHAR dllPath[MAX_PATH];
+    GetModuleFileNameW(NULL, dllPath, MAX_PATH);
+    WCHAR* lastBackslash = wcsrchr(dllPath, L'\\');
+    if (lastBackslash != NULL) {
+        *(lastBackslash + 1) = L'\0';
+        wcscat_s(dllPath, L"DllToInject.dll");
+    }
+
+    printf("DLL Path: %ws\n", dllPath);  // Debug print
+
+    // Create child process
+    STARTUPINFO si = { sizeof(STARTUPINFO) };
+    PROCESS_INFORMATION pi;
+    
+    // Create suspended process to inject into
+    if (!CreateProcessW(
+        L"C:\\Windows\\System32\\notepad.exe",  // You can change this to your target process
+        NULL,
+        NULL,
+        NULL,
+        FALSE,
+        CREATE_SUSPENDED,
+        NULL,
+        NULL,
+        &si,
+        &pi))
+    {
+        printf("CreateProcess failed, error=%x\n", GetLastError());
+        return -1;
+    }
+
+    INJECTION_CONTEXT InjectionContext;
+    memset(&InjectionContext, 0, sizeof(InjectionContext));
+    memcpy(InjectionContext.shellcode, shellcode_data_x64, sizeof(shellcode_data_x64));
+    InjectionContext.rpLoadLibrary = LoadLibraryW;
+    InjectionContext.rpGetLastError = GetLastError;
+    wcscpy_s(InjectionContext.DllName, dllPath);
+
+    // Use child process handle instead of current process
+    HANDLE hProcess = pi.hProcess;
+    
+    PINJECTION_CONTEXT rpInjectionContext = (PINJECTION_CONTEXT)VirtualAllocEx(hProcess, NULL, sizeof(*rpInjectionContext), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (rpInjectionContext == NULL) {
+        printf("VirtualAllocEx failed, error=%x\n", GetLastError());
         goto error1;
     }
-    printf("Dll was successfully loaded! \n");
-//#else
-//    DWORD tid;
-//
-//    INJECTION_CONTEXT InjectionContext;
-//    memset(&InjectionContext, 0, sizeof(InjectionContext));
-//    memcpy(InjectionContext.shellcode, shellcode_data_x64, sizeof(shellcode_data_x64));
-//    InjectionContext.rpLoadLibrary = LoadLibrary;   //TODO: see comment above, for well-known dll asumme that p===rp
-//    InjectionContext.rpGetLastError = GetLastError; //TODO: see comment above, for well-known dll asumme that p===rp
-//    PCWSTR dllName = L"aaaDllToInject.dll";
-//    size_t dllNameSize = (wcslen(dllName) + 1) * sizeof(WCHAR);
-//    memcpy(InjectionContext.DllName, dllName, dllNameSize);
-//
-//    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, GetCurrentProcessId());
-//    //TODO: check
-//    PINJECTION_CONTEXT rpInjectionContext = (PINJECTION_CONTEXT)VirtualAllocEx(hProcess, NULL, sizeof(*rpInjectionContext), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-//    //TODO: check
-//    SIZE_T bytesWritten;
-//    WriteProcessMemory(hProcess, rpInjectionContext, &InjectionContext, sizeof(InjectionContext), &bytesWritten);
-//    //TODO: check
 
-//#if 0
-//    HANDLE h = CreateRemoteThread(hProcess, NULL, 0, InjectorThread, rpInjectionContext, 0, &tid);
-//#else
-//    HANDLE h = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)rpInjectionContext, rpInjectionContext, 0, &tid);
-//#endif
-//    if (nullptr == h) {
-//        printf("Inject thread creation failed code=%x ! \n", GetLastError());
-//        goto error1;
-//    }
-//    WaitForSingleObject(h, INFINITE);
-//    DWORD result;
-//    if (!GetExitCodeThread(h, &result)) {
-//        printf("GetExitCodeThread failed code =%x ! \n", GetLastError());
-//        goto error2;
-//    }
-//
-//    if (0 != result) {
-//        printf("Inject thread failed with code =%x ! \n", result);
-//    }
-//    res = 0; //all is ok
-//#endif
-//
-//error2:
-//    CloseHandle(h);
+    SIZE_T bytesWritten;
+    if (!WriteProcessMemory(hProcess, rpInjectionContext, &InjectionContext, sizeof(InjectionContext), &bytesWritten)) {
+        printf("WriteProcessMemory failed, error=%x\n", GetLastError());
+        goto error2;
+    }
+
+    DWORD tid;
+    h = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)rpInjectionContext, rpInjectionContext, 0, &tid);
+    if (nullptr == h) {
+        printf("Inject thread creation failed code=%x ! \n", GetLastError());
+        goto error2;
+    }
+
+    WaitForSingleObject(h, INFINITE);
+    DWORD result;
+    if (!GetExitCodeThread(h, &result)) {
+        printf("GetExitCodeThread failed code =%x ! \n", GetLastError());
+        goto error2;
+    }
+
+    if (0 != result) {
+        printf("Inject thread failed with code =%x ! \n", result);
+    } else {
+        printf("Injection successful, resuming thread\n");
+        ResumeThread(pi.hThread);
+    }
+    res = 0;
+
+error2:
+    if (h) CloseHandle(h);
 error1:
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
     return res;
 }
 
